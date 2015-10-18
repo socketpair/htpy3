@@ -5,7 +5,8 @@ cfg = HTPConfig()
 
 class MyTransaction(HTPTrans):
     def __init__(self, connp, counter):
-        super().__init__(connp)
+        super().__init__()
+        self.connp = connp
         self.counter = counter
 
     def on_request_body_data(self, qwe):
@@ -28,28 +29,28 @@ class MyHTTPConnp(HTPConnp):
 def test_weird_pipeline():
     qwe = MyHTTPConnp()
     qwe.handle_connect('1.2.3.4', 80, '127.0.0.1', 12345)
-    qwe.push_in(b'\r\n'.join([
+    qwe.push_request_data(b'\r\n'.join([
         b'POST / HTTP/1.1',
         b'host: yandex.ru',
         b'content-length: 2',
         b'',
         b'12',
     ]))
-    qwe.push_out(b'\r\n'.join([
+    qwe.push_response_data(b'\r\n'.join([
         b'HTTP/1.1 200 OK',
         b'Content-Length: 3',
         b'',
         b'',
     ]))
-    qwe.push_in(b'\r\n'.join([
+    qwe.push_request_data(b'\r\n'.join([
         b'GET / HTTP/1.1',
         b'host: yandex.ru',
         b'content-length: 2',
         b'',
         b'34',
     ])) # pipelinig
-    qwe.push_out(b'abc')
-    qwe.push_out(b'\r\n'.join([
+    qwe.push_response_data(b'abc')
+    qwe.push_response_data(b'\r\n'.join([
         b'HTTP/1.1 200 OK',
         b'content-length: 3',
         b'',
@@ -60,27 +61,27 @@ def test_weird_pipeline():
 def test_pipeline():
     qwe = MyHTTPConnp()
     qwe.handle_connect('1.2.3.4', 80, '127.0.0.1', 12345)
-    qwe.push_in(b'\r\n'.join([
+    qwe.push_request_data(b'\r\n'.join([
         b'POST / HTTP/1.1',
         b'host: yandex.ru',
         b'content-length: 2', 
         b'',
         b'12',
     ]))
-    qwe.push_in(b'\r\n'.join([
+    qwe.push_request_data(b'\r\n'.join([
         b'PUT / HTTP/1.1',
         b'host: yandex.ru',
         b'content-length: 3', 
         b'',
         b'456',
     ]))
-    qwe.push_out(b'\r\n'.join([
+    qwe.push_response_data(b'\r\n'.join([
         b'HTTP/1.1 200 OK',
         b'Content-Length: 2',
         b'',
         b'ab',
     ]))
-    qwe.push_out(b'\r\n'.join([
+    qwe.push_response_data(b'\r\n'.join([
         b'HTTP/1.1 200 OK',
         b'Content-Length: 3',
         b'',

@@ -66,11 +66,18 @@ cdef extern from "htp/htp.h":
 
     ctypedef struct htp_tx_t:
         htp_connp_t *connp
+
+        bstr *request_line # raw
         bstr *request_method # raw
         bstr *request_uri # raw
         bstr *request_protocol # raw
         htp_uri_t *parsed_uri
         htp_uri_t *parsed_uri_raw
+
+        bstr *response_line
+        #Response status code, available only if we were able to parse it, HTP_STATUS_INVALID
+        #otherwise. HTP_STATUS_UNKNOWN until parsing is attempted.
+        int response_status_number
 
     ctypedef struct htp_tx_data_t:
         htp_tx_t *tx
@@ -148,11 +155,11 @@ cdef int log_cb(htp_log_t *l) nogil:
 
 #########################
 cdef bstr2bytes(bstr* s):
+    if s is NULL:
+        return None
     cdef size_t l = bstr_len(s)
     cdef const char* p = <char*>bstr_ptr(s)
     return p[:l]
-
-
 
 #########################
 cdef int request_start_cb(htp_tx_t *tx) nogil:
@@ -193,7 +200,7 @@ cdef int request_line_cb(htp_tx_t *tx) nogil:
     with gil:
         trans = <HTPTrans>transdata
         try:
-            trans.on_request_line(bstr2bytes(tx.request_method), bstr2bytes(tx.request_uri), bstr2bytes(tx.request_protocol))
+            trans.on_request_line(bstr2bytes(tx.request_line), bstr2bytes(tx.request_method), bstr2bytes(tx.request_uri), bstr2bytes(tx.request_protocol))
             return HTP_OK
         except BaseException as e:
             connp = <HTPConnp>htp_connp_get_user_data(tx.connp)
@@ -320,8 +327,8 @@ cdef int response_line_cb(htp_tx_t *tx) nogil:
     with gil:
         trans = <HTPTrans>transdata
         try:
-            # TODO: pass resp line here
-            trans.on_response_line()
+            # HTP_PROTOCOL_INVALID otherwise. HTP_PROTOCOL_UNKNOWN until parsing is attempted.
+            trans.on_response_line(bstr2bytes(tx.response_line), tx.response_status_number)
             return HTP_OK
         except BaseException as e:
             connp = <HTPConnp>htp_connp_get_user_data(tx.connp)
@@ -485,59 +492,64 @@ cdef class HTPConfig:
 
 # TODO: move it to __init__ to pure python!
 cdef class HTPTrans:
-    def __init__(self, connp):
-        self.connp = connp
+    def __init__(self):
+        self.debug = False
+
+    def debugline(self, *args):
+        if self.debug:
+            # todo: cython does not support print(*args, **kwargs)
+            print(args)
 
     def on_request_body_data(self, qwe):
-        print('request_body_data DUMMY')
+        self.debugline('request_body_data DUMMY')
 
     def on_request_header_data(self, qwe):
-        print('request_header_data DUMMY')
+        self.debugline('request_header_data DUMMY')
 
     def on_request_headers(self):
-        print('request_headers DUMMY')
+        self.debugline('request_headers DUMMY')
 
     def on_request_complete(self):
-        print('request_complete DUMMY')
+        self.debugline('request_complete DUMMY')
 
-    def on_request_line(self, method, uri, protocol):
-        print('request_line DUMMY', method, uri, protocol)
+    def on_request_line(self, raw_reqline, method, uri, protocol):
+        self.debugline('request_line DUMMY', method, uri, protocol)
 
     def on_request_uri_normalize(self):
-        print('request_uri_normalize DUMMY')
+        self.debugline('request_uri_normalize DUMMY')
 
     def on_request_trailer_data(self, qwe):
-        print('request_header_data DUMMY')
+        self.debugline('request_header_data DUMMY')
 
     def on_request_trailer(self):
-        print('request_uri_normalize DUMMY')
+        self.debugline('request_uri_normalize DUMMY')
 
     def on_response_body_data(self, qwe):
-        print('response_body_data DUMMY')
+        self.debugline('response_body_data DUMMY')
 
     def on_response_header_data(self, qwe):
-        print('response_header_data DUMMY')
+        self.debugline('response_header_data DUMMY')
 
     def on_response_headers(self):
-        print('response_headers DUMMY')
+        self.debugline('response_headers DUMMY')
 
     def on_response_complete(self):
-        print('response_complete DUMMY')
+        self.debugline('response_complete DUMMY')
 
     def on_response_start(self):
-        print('response_start DUMMY')
+        self.debugline('response_start DUMMY')
 
-    def on_response_line(self):
-        print('response_line DUMMY')
+    def on_response_line(self, line, status):
+        self.debugline('response_line DUMMY', line, status)
 
     def on_response_trailer_data(self, qwe):
-        print('response_header_data DUMMY')
+        self.debugline('response_header_data DUMMY')
 
     def on_response_trailer(self):
-        print('response_uri_normalize DUMMY')
+        self.debugline('response_uri_normalize DUMMY')
 
     def on_transaction_complete(self):
-        print('transaction_complete DUMMY')
+        self.debugline('transaction_complete DUMMY')
 
 
 cdef class HTPConnp:
@@ -619,7 +631,7 @@ cdef class HTPConnp:
             self._cbexc = None
             raise exc
 
-    # def push_in(self, unsigned char[:] data, ts):
+    # def push_request_data(self, unsigned char[:] data, ts):
     #     cdef:
     #         htp_time_t tv
     #         int res
@@ -627,7 +639,7 @@ cdef class HTPConnp:
     #     tv.tv_usec = (ts % 1000000000) // 1000
     #     res = htp_connp_req_data(self.connp, &tv, &data[0], data.shape[0])
     #     return res
-    def push_in(self, data, ts=None):
+    def push_request_data(self, data, ts=None):
         if self.in_callback:
             raise RuntimeError('It is not allowed to call this function from handle_XXX')
 
@@ -677,7 +689,7 @@ cdef class HTPConnp:
         raise NotImplementedError('Dont know how to handle stream state {}'.format(res))
 
 
-    def push_out(self, data, ts=None):
+    def push_response_data(self, data, ts=None):
         if self.in_callback:
             raise RuntimeError('It is not allowed to call this function from handle_XXX')
 
@@ -755,5 +767,4 @@ cdef class HTPConnp:
             raise exc
 
     def on_request_start(self):
-        print('request_start DUMMY')
         return None

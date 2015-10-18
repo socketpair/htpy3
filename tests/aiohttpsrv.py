@@ -1,4 +1,6 @@
 import asyncio
+import shutil
+import tempfile
 import time
 
 from htpy3 import HTPConnp, HTPConfig, HTPTrans
@@ -6,79 +8,37 @@ from htpy3 import HTPConnp, HTPConfig, HTPTrans
 cfg = HTPConfig()
 
 
-class RequestHandler:
-    def __init__(self, httpsrv):
-        super().__init__()
-        self.httpsrv = httpsrv
-
-    def handle(self):
-        pass
+@asyncio.coroutine
+def conn_handler(localreader: asyncio.StreamReader, localwriter: asyncio.StreamWriter):
+    (remote_reader, remote_writer) = yield from asyncio.open_connection('www.yandex.ru', 80)
+    MyHTTPSrv(localreader, localwriter, remote_reader, remote_writer)
 
 
-class MyTransaction(HTPTrans):
-    def __init__(self, connp):
-        print('creating trans')
-        super().__init__(connp)
-        self.may_start_responding = asyncio.Future()
-        self.banpage = None
-        self.chunks = []
-
-    @asyncio.coroutine
-    def get_result(self):
-        print('Okay waiting for req to complete')
-        yield from self.may_start_responding
-        print('Req complete. generating response')
-        if self.banpage is not None:
-            response = self.banpage
-            d = response.encode('utf-8')
-            self.connp.do_writelines([b'\r\n'.join([
-                b'HTTP/1.1 403 OK',
-                b'Content-Length: ' + str(len(d)).encode('ascii'),
-                b'',
-                d,
-            ])])
-            # self.write_end_complete = True
-        else:
-            response = 'Hello world!\n'
-            d = response.encode('utf-8')
-            self.connp.do_writelines([b'\r\n'.join([
-                b'HTTP/1.1 200 OK',
-                b'Content-Length: ' + str(len(d)).encode('ascii'),
-                b'',
-                d,
-            ])])
-            # self.write_end_complete = True
-
-    def on_request_line(self, method, path, version):
-        print('req line', method, path, version)
-        if b'test' in path:
-            self.banpage = 'Blocked by url'
-            return
-        # TODO: parse URL and potentially switch to blockpage generatorrespond with blockpage based on URL
-        # TODO: also hack URL if required.
-        # TODO: it may be deirable to hack hostname also
-        # TODO: method as integer constant!
-        # TODO: parsed uri can be get in another hook
-        pass
-
-    # def on_request_headers(self):
-    #     # TODO: analyze request content-type (if any) and potentially switch to
-    #     pass
-
-    def on_request_complete(self):
-        print('req complete')
-        self.may_start_responding.set_result(None)
-
-
-class MyHTTPSrv(asyncio.Protocol, HTPConnp):
-    def __init__(self):
+# TODO: timeouts!
+class MyHTTPSrv(HTPConnp):
+    def __init__(self, localreader: asyncio.StreamReader, localwriter: asyncio.StreamWriter,
+                 remotereader: asyncio.StreamReader, remotewriter: asyncio.StreamWriter):
         super().__init__(cfg)
+        self.localreader = localreader
+        self.localwriter = localwriter
+        self.remotereader = remotereader
+        self.remotewriter = remotewriter
         self.responses = asyncio.Queue()
         # https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.create_task
-        asyncio.get_event_loop().create_task(self.writerloop()) # TODO: returns task?...
+        # asyncio callback
+        print("connection_made")
+        (rip, rport) = localwriter.transport.get_extra_info('peername')
+        (lip, lport) = localwriter.transport.get_extra_info('sockname')
+        self.handle_connect(rip, rport, lip, lport, time.monotonic())
+
+
+        # TODO: make racy megatask
+        asyncio.get_event_loop().create_task(self.local_writer_loop())  # TODO: returns task?...
+        asyncio.get_event_loop().create_task(self.local_reader_loop())  # TODO: returns task?...
+        asyncio.get_event_loop().create_task(self.remote_reader_loop())  # TODO: returns task?...
 
     @asyncio.coroutine
-    def writerloop(self):
+    def local_writer_loop(self):
         try:
             while True:
                 trans = yield from self.responses.get()
@@ -86,41 +46,52 @@ class MyHTTPSrv(asyncio.Protocol, HTPConnp):
                     break
                 yield from trans.get_result()
 
-        except Exception as e:
-            print('writerloop exceoption:', repr(e))
+        finally:
+            # TODO: check libhtp state
+            # TODO: properly abort  waiting tasks on that connection and abrupt it!
+            self.handle_close(time.monotonic())
+            self.localwriter.close()
+            self.remotewriter.close()
 
-        # TODO: properly abort  waiting tasks on that connection and abrupt it!
-        self.handle_close(time.monotonic())
-        self.transport.close()
+    @asyncio.coroutine
+    def local_reader_loop(self):
+        try:
+            while True:
+                data = yield from self.localreader.read(65536)
+                if not data:
+                    break
+                self.push_request_data(data, time.monotonic())
+                try:
+                    yield from self.remotewriter.drain()
+                except ConnectionResetError:
+                    print('Remote has reset connection')
+                    break
+        finally:
+            # TODO: check libhtp state
+            # TODO: properly abort  waiting tasks on that connection and abrupt it!
+            self.responses.put_nowait(None)
+            self.handle_close(time.monotonic())
+            self.localwriter.close()
 
-    def connection_made(self, transport):
-        # asyncio callback
-        print("connection_made")
-        (rip, rport) = transport.get_extra_info('peername')
-        (lip, lport) = transport.get_extra_info('sockname')
-        self.transport = transport
-        self.handle_connect(rip, rport, lip, lport, time.monotonic())
-
-    def connection_lost(self, exc):
-        # asyncio callback
-        if exc is not None:
-            print("connection_lost", exc)
-        self.responses.put_nowait(None)
-
-    def eof_received(self):
-        # asyncio callback
-        print("eof received")
-        self.responses.put_nowait(None)
-
-    def data_received(self, data):
-        # asyncio callback
-        self.push_in(data, time.monotonic())
-
-    def do_writelines(self, chunks):
-        for i in chunks:
-            if i:
-                self.push_out(i, time.monotonic())
-        self.transport.writelines(chunks)
+    @asyncio.coroutine
+    def remote_reader_loop(self):
+        try:
+            while True:
+                data = yield from self.remotereader.read(65536)
+                if not data:
+                    break
+                self.push_response_data(data, time.monotonic())
+                try:
+                    yield from self.localwriter.drain()
+                except ConnectionResetError:
+                    print('Remote has reset connection')
+                    break
+        finally:
+            # TODO: check libhtp state
+            # TODO: properly abort  waiting tasks on that connection and abrupt it!
+            self.responses.put_nowait(None)
+            self.handle_close(time.monotonic())
+            self.localwriter.close()
 
     def on_request_start(self):
         print('on_request_start')
@@ -128,10 +99,269 @@ class MyHTTPSrv(asyncio.Protocol, HTPConnp):
         self.responses.put_nowait(trans)
         return trans
 
+
+class MyTransaction(HTPTrans):
+    def __init__(self, connp: MyHTTPSrv):
+        super().__init__()
+        self.request_splice = False
+        self.response_splice_mode = False
+        self.orig_response_chunks = []
+        self.connp = connp
+        self.may_start_responding = asyncio.Future()
+        self.response_complete = asyncio.Future()
+        self.banpage = None
+        self.transaction_complete = False
+        self.reqbodytmpfile = tempfile.SpooledTemporaryFile()
+        self.responsetmpfile = tempfile.SpooledTemporaryFile()
+        self.last_req_unsent_byte = None
+
+    def write_banpage(self):
+        response = self.banpage
+        d = response.encode('utf-8')
+        # simulate data from remoteserver
+        self.connp.localwriter.write(b'\r\n'.join([
+            b'HTTP/1.1 403 Forbidden',
+            'Content-Length: {}'.format(len(d)).encode('ascii'),
+            # required, since we also close remote connection. closing because only partial req is sent
+            b'Connection: close',
+            b'',
+            d,
+        ]))
+        self.connp.remotewriter.close()
+        self.connp.localwriter.close()
+        self.response_complete.set_result(None)
+
+    @asyncio.coroutine
+    def get_result(self):
+        yield from self.may_start_responding
+        self.reqbodytmpfile.close()
+        if self.banpage is not None:
+            self.write_banpage()
+            return
+        print('response should be written. waiting')
+        yield from self.response_complete
+        self.responsetmpfile.close()
+
+    def on_response_line(self, line, statusnum):
+        # TODO: on invalid line there will not be \r\n actually.
+        if not line:
+            return
+        self.responsetmpfile.write(line)
+        self.responsetmpfile.write(b'\r\n')
+        # there is nothing to scan in response line...
+
+    def on_response_header_data(self, data):
+        if not data:
+            return
+        self.responsetmpfile.write(data)
+
+    def on_response_headers(self):
+        if True is False:
+            # if banned by content-type of response
+            self.banpage = 'banned by response headers'
+            self.write_banpage()
+            return
+
+        if True is False:
+            # if allowed by some content-type
+            self.response_splice_mode = True
+            self.responsetmpfile.seek(0)
+            shutil.copyfileobj(self.responsetmpfile, self.connp.localwriter, 65536)
+            self.responsetmpfile.truncate(0)
+            return
+
+    def on_response_body_data(self, data):
+        if not data:
+            return
+
+        if self.banpage is not None:
+            # may happen if response and bad headers are send in one big chunk
+            return
+
+        if self.response_splice_mode:
+            self.connp.localwriter.write(data)
+            return
+
+        if True is False:
+            self.response_splice_mode = True
+            self.responsetmpfile.seek(0)
+            shutil.copyfileobj(self.responsetmpfile, self.connp.localwriter, 65536)
+            self.responsetmpfile.truncate(0)
+            self.connp.localwriter.write(data)
+            return
+
+        if True is False:
+            self.banpage = 'Banned in streaming mode'
+            self.write_banpage()
+            return
+
+        self.responsetmpfile.write(data)
+
+    def on_response_trailer_data(self, data):
+        if not data:
+            return
+
+        if self.banpage is not None:
+            # may happen if response and bad headers are send in one big chunk
+            return
+
+        if self.response_splice_mode:
+            self.connp.localwriter.write(data)
+            return
+
+        self.responsetmpfile.write(data)
+
+    def on_response_complete(self):
+        if self.banpage is not None:
+            return
+        if self.response_splice_mode:
+            return
+
+        if True is False:
+            self.banpage = 'Banned based on full request data'
+            self.write_banpage()
+            return
+
+        self.responsetmpfile.seek(0)
+        shutil.copyfileobj(self.responsetmpfile, self.connp.localwriter, 65536)
+        self.responsetmpfile.truncate(0)
+
+    def on_transaction_complete(self):
+        if self.banpage is not None:
+            # may happen if response and bad headers are send in one big chunk
+            return
+
+        if self.response_splice_mode:
+            self.response_complete.set_result(None)
+            return
+
+        print('Transaction complete')
+        self.response_complete.set_result(None)
+
+    # TODO: connp->in_chunked_length - data left in current chunk
+    def on_request_line(self, raw_req_line, method, path, version):
+        # TODO: on invalid line there will not be \r\n actually.
+        if True is False:
+            self.banpage = 'Blocked by url'
+            return
+        if True is False:
+            # request can be fully spliced
+            self.request_splice = True
+            self.connp.remotewriter.writelines([raw_req_line, b'\r\n'])
+            return
+        self.connp.remotewriter.writelines([raw_req_line, b'\r\n'])
+
+    def on_request_header_data(self, data):
+        data = data.replace(b'localhost:8888', b'www.yandex.ru')
+        if not data:
+            return
+        if self.banpage is not None:
+            return
+        if self.request_splice:
+            self.connp.remotewriter.write(data)
+            return
+        buf = []
+        if self.last_req_unsent_byte:
+            buf.append(self.last_req_unsent_byte)
+            self.last_req_unsent_byte = None
+
+        self.last_req_unsent_byte = data[-1:]
+        data = data[:-1]
+        if data:
+            buf.append(data)
+        if buf:
+            self.connp.remotewriter.writelines(buf)
+
+    def on_request_headers(self):
+        if self.banpage is not None:
+            return
+        if self.request_splice:
+            return
+        # TODO: analyze headers from HTP-collected data!!!
+        if True is False:
+            self.banpage = 'Blocked by HTTP headers'
+            return
+        if True is False:
+            self.request_splice = True
+            if self.last_req_unsent_byte:
+                self.connp.remotewriter.write(self.last_req_unsent_byte)
+                self.last_req_unsent_byte = None
+
+    # de-chunked and de-compressed data....
+    def on_request_body_data(self, data):
+        if not data:
+            return
+        if self.banpage is not None:
+            return
+        if self.request_splice:
+            self.connp.remotewriter.write(data)
+            return
+
+        buf = []
+        if self.last_req_unsent_byte:
+            buf.append(self.last_req_unsent_byte)
+            self.last_req_unsent_byte = None
+
+        if True is False:
+            self.banpage = 'Blocked by req body contents in streaming mode!'
+            self.reqbodytmpfile.truncate(0)
+            return
+
+        if True is False:
+            self.request_splice = True
+            self.reqbodytmpfile.truncate(0)
+            buf.append(data)
+            self.connp.remotewriter.writelines(buf)
+            return
+
+        self.reqbodytmpfile.write(data)
+        self.last_req_unsent_byte = data[-1:]
+        data = data[:-1]
+        if data:
+            buf.append(data)
+        if buf:
+            self.connp.remotewriter.writelines(buf)
+
+    def on_request_trailer_data(self, data):
+        if not data:
+            return
+        if self.banpage is not None:
+            return
+        if self.request_splice:
+            self.connp.remotewriter.write(data)
+            return
+        buf = []
+        if self.last_req_unsent_byte:
+            buf.append(self.last_req_unsent_byte)
+            self.last_req_unsent_byte = None
+        buf.append(data)
+        self.connp.remotewriter.writelines(data)
+
+    def on_request_complete(self):
+        if self.banpage is not None:
+            self.may_start_responding.set_result(None)
+            return
+        if self.request_splice:
+            self.may_start_responding.set_result(None)
+            return
+
+        #self.reqbodytmpfile.seek(0)
+        #if b'asdasdsdfsdf22asd' in self.reqbodytmpfile.read():
+        if True is False:
+            self.banpage = 'Blocked by req body contents in non-streaming mode!'
+            self.may_start_responding.set_result(None)
+            return
+
+        if self.last_req_unsent_byte:
+            self.connp.remotewriter.writelines([self.last_req_unsent_byte])
+            self.last_req_unsent_byte = None
+
+        self.may_start_responding.set_result(None)
+
+
 def main():
     loop = asyncio.get_event_loop()
-    # Each client connection will create a new protocol instance
-    coro = loop.create_server(MyHTTPSrv, '127.0.0.1', 8888)
+    coro = asyncio.start_server(conn_handler, '127.0.0.1', 8888)
     server = loop.run_until_complete(coro)
 
     # Serve requests until Ctrl+C is pressed
@@ -141,14 +371,9 @@ def main():
     except KeyboardInterrupt:
         pass
 
-    # Close the server
     server.close()
-
-    # asyncio.start_server!!!!!!!!!!!!!!!!!!!!!!!
-
     loop.run_until_complete(server.wait_closed())
     loop.close()
-
 
 if __name__ == '__main__':
     main()
